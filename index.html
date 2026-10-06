@@ -37,6 +37,15 @@ h1{font:600 20px/1.1 var(--cond);margin:0;letter-spacing:.01em}
 button:focus-visible,.toggle input:focus-visible{outline:2px solid var(--pivot);outline-offset:2px}
 main{flex:1;position:relative;min-height:320px}
 #chart{position:absolute;inset:0}
+#draw{position:absolute;left:0;top:0;z-index:5;pointer-events:none;touch-action:none;overflow:hidden}
+#draw.active{pointer-events:auto;cursor:crosshair}
+#draw text{font:500 13px var(--font);paint-order:stroke;stroke:var(--paper);stroke-width:4px;stroke-linejoin:round}
+.drawbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:8px 16px;border-bottom:1px solid var(--rule)}
+.drawbar .lbl{font-size:13px;color:var(--ink2)}
+.hint{position:absolute;left:10px;top:8px;z-index:6;pointer-events:none;font-size:13px;color:var(--ink);background:var(--paper);border:1px solid var(--rule);border-radius:3px;padding:5px 8px;display:none}
+.hint:not(:empty){display:block}
+.btn.sm{padding:7px 11px;font-size:13px}
+.btn:disabled{opacity:.35;cursor:default}
 .readout{display:flex;flex-wrap:wrap;gap:4px 16px;padding:8px 16px;border-top:1px solid var(--rule);font:13px/1.3 var(--font);font-variant-numeric:tabular-nums;color:var(--ink2);min-height:36px}
 .readout b{font-weight:500;color:var(--ink)}
 .empty{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:24px;text-align:center;color:var(--ink2)}
@@ -79,8 +88,19 @@ footer a{color:inherit}
     <label class="toggle"><input type="checkbox" id="tGap" checked>Gap strategy</label>
   </div>
 </header>
+<div class="drawbar">
+  <span class="lbl">Draw</span>
+  <div class="seg" role="group" aria-label="Drawing tool" id="tools">
+    <button data-tool="off" aria-pressed="true">Pan</button><button data-tool="line">Line</button><button data-tool="hline">H-line</button><button data-tool="up" aria-label="Up arrow">↑ Up</button><button data-tool="down" aria-label="Down arrow">↓ Down</button><button data-tool="text">Text</button>
+  </div>
+  <button class="btn sm" id="dDel" disabled>Delete selected</button>
+  <button class="btn sm" id="dUndo">Undo</button>
+  <button class="btn sm" id="dClear">Clear all</button>
+</div>
 <main>
   <div id="chart"></div>
+  <svg id="draw" xmlns="http://www.w3.org/2000/svg"></svg>
+  <div class="hint" id="hint" aria-live="polite"></div>
   <div class="empty" id="empty">
     <p id="emptyMsg">Loading the latest data from GitHub…</p>
     <button class="btn" id="pick" hidden>Open a CSV file</button>
@@ -231,7 +251,10 @@ function buildChart(){
   });
   const ink = css("--ink");
   series = chart.addCandlestickSeries({upColor:css("--up"), downColor:ink, borderUpColor:ink, borderDownColor:ink, wickUpColor:ink, wickDownColor:ink, priceLineVisible:true, lastValueVisible:true});
-  chart.subscribeCrosshairMove(p => {
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => redrawD());
+  chart.timeScale().subscribeSizeChange(() => redrawD());
+  chart.subscribeClick(p => { if (tool === "off" && p.point) selectD(hitD(p.point.x, p.point.y)); });
+  chart.subscribeCrosshairMove(p => { redrawD();
     const d = p.time !== undefined && p.seriesData.get(series);
     showReadout(d || null);
   });
@@ -265,6 +288,7 @@ function render(keepView){
   const n = bars.length, narrow = innerWidth < 640, show = tf === "D" ? (narrow ? 60 : 120) : (narrow ? 80 : 160);
   chart.timeScale().setVisibleLogicalRange({from: Math.max(0, n - show), to: n + 5});
   showReadout(null);
+  redrawD();
 }
 
 function tradeTable(){
@@ -309,6 +333,108 @@ document.querySelectorAll("#tf button").forEach(b => b.addEventListener("click",
 ["tSmall","tLarge","tPrev","tGap","pSL","pBE","pLast"].forEach(id => $(id).addEventListener("change", () => raw.length && render()));
 $("pick").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", e => { const f = e.target.files[0]; if (!f) return; f.text().then(t => load(t, f.name)); });
+
+// ---------- drawings: lines, horizontal lines, text (saved on this device) ----------
+let drawings = [], tool = "off", pending = null, rubber = null, selected = null;
+try { drawings = JSON.parse(localStorage.getItem("drawings_v1") || "[]"); } catch(e){ drawings = []; }
+const saveD = () => { try { localStorage.setItem("drawings_v1", JSON.stringify(drawings)); } catch(e){} };
+const barSec = () => tf === "D" ? 86400 : +tf * 60;
+function logicalFromTime(t){
+  const n = bars.length; if (!n) return null;
+  if (t < bars[0].time) return (t - bars[0].time) / barSec();
+  let lo = 0, hi = n - 1; while (lo < hi){ const m = (lo + hi + 1) >> 1; if (bars[m].time <= t) lo = m; else hi = m - 1; }
+  const f = (t - bars[lo].time) / barSec(); return lo === n - 1 ? lo + f : lo + Math.min(f, 0.999);
+}
+function timeFromLogical(l){
+  const n = bars.length, i = Math.max(0, Math.min(n - 1, Math.floor(l)));
+  return Math.round(bars[i].time + (l - i) * barSec());
+}
+const X = t => { const l = logicalFromTime(t); return l === null ? null : chart.timeScale().logicalToCoordinate(l); };
+const Y = p => series.priceToCoordinate(p);
+function ptFromXY(x, y){ const l = chart.timeScale().coordinateToLogical(x), p = series.coordinateToPrice(y);
+  return (l === null || p === null) ? null : {t: timeFromLogical(l), p}; }
+function svgEl(tag, a){ const e = document.createElementNS("http://www.w3.org/2000/svg", tag); for (const k in a) e.setAttribute(k, a[k]); return e; }
+let rq = 0;
+function redrawD(){ if (rq) return; rq = requestAnimationFrame(() => { rq = 0; paintD(); }); }
+function paintD(){
+  const svg = $("draw"); if (!chart || !bars.length) return;
+  const ps = chart.paneSize(); svg.setAttribute("width", ps.width); svg.setAttribute("height", ps.height);
+  svg.style.width = ps.width + "px"; svg.style.height = ps.height + "px"; svg.innerHTML = "";
+  const ink = css("--ink"), sel = css("--pivot");
+  const all = drawings.concat(rubber ? [rubber] : []);
+  for (const d of all){
+    const c = d === selected ? sel : ink, w = d === selected ? 2.2 : 1.5;
+    if (d.type === "line"){
+      const x1 = X(d.a.t), y1 = Y(d.a.p), x2 = X(d.b.t), y2 = Y(d.b.p); if ([x1,y1,x2,y2].some(v => v === null)) continue;
+      svg.appendChild(svgEl("line", {x1, y1, x2, y2, stroke:c, "stroke-width":w, "stroke-linecap":"round"}));
+      if (d === selected || d === rubber) for (const [x,y] of [[x1,y1],[x2,y2]]) svg.appendChild(svgEl("circle", {cx:x, cy:y, r:4, fill:css("--paper"), stroke:c, "stroke-width":1.5}));
+    } else if (d.type === "hline"){
+      const y = Y(d.a.p); if (y === null) continue;
+      svg.appendChild(svgEl("line", {x1:0, y1:y, x2:ps.width, y2:y, stroke:c, "stroke-width":w}));
+      const t = svgEl("text", {x:ps.width - 6, y:y - 5, fill:c, "text-anchor":"end"}); t.textContent = fmt(d.a.p); svg.appendChild(t);
+    } else if (d.type === "up" || d.type === "down"){
+      const x = X(d.a.t), y = Y(d.a.p); if (x === null || y === null) continue;
+      const s = d.type === "up" ? 1 : -1;                 // tip sits exactly at the tapped price
+      svg.appendChild(svgEl("line", {x1:x, y1:y + s*9, x2:x, y2:y + s*28, stroke:c, "stroke-width":2.6, "stroke-linecap":"round"}));
+      svg.appendChild(svgEl("path", {d:`M${x} ${y} L${x - 8} ${y + s*12} L${x + 8} ${y + s*12} Z`, fill:c, stroke:c, "stroke-width":1, "stroke-linejoin":"round"}));
+      if (d === selected) svg.appendChild(svgEl("rect", {x:x - 12, y:Math.min(y, y + s*30) - 2, width:24, height:34, fill:"none", stroke:c, "stroke-dasharray":"3 3"}));
+    } else if (d.type === "text"){
+      const x = X(d.a.t), y = Y(d.a.p); if (x === null || y === null) continue;
+      const t = svgEl("text", {x, y, fill:c}); t.textContent = d.text; svg.appendChild(t);
+      if (d === selected){ const bb = t.getBBox(); svg.insertBefore(svgEl("rect", {x:bb.x - 3, y:bb.y - 2, width:bb.width + 6, height:bb.height + 4, fill:"none", stroke:c, "stroke-dasharray":"3 3"}), t); }
+    }
+  }
+}
+function hitD(x, y){
+  let best = null, bd = 14;
+  for (const d of drawings){
+    let dist = Infinity;
+    if (d.type === "hline"){ const yy = Y(d.a.p); if (yy !== null) dist = Math.abs(y - yy); }
+    else if (d.type === "up" || d.type === "down"){ const xx = X(d.a.t), yy = Y(d.a.p);
+      if (xx !== null && yy !== null){ const top = d.type === "up" ? yy - 4 : yy - 32, bot = d.type === "up" ? yy + 32 : yy + 4;
+        if (x >= xx - 12 && x <= xx + 12 && y >= top && y <= bot) dist = 0; } }
+    else if (d.type === "text"){ const xx = X(d.a.t), yy = Y(d.a.p); if (xx !== null && yy !== null && x >= xx - 6 && x <= xx + 8 * d.text.length + 6 && y >= yy - 18 && y <= yy + 6) dist = 0; }
+    else { const x1 = X(d.a.t), y1 = Y(d.a.p), x2 = X(d.b.t), y2 = Y(d.b.p);
+      if (![x1,y1,x2,y2].some(v => v === null)){ const dx = x2 - x1, dy = y2 - y1, L = dx*dx + dy*dy || 1;
+        const u = Math.max(0, Math.min(1, ((x - x1)*dx + (y - y1)*dy) / L)); dist = Math.hypot(x - (x1 + u*dx), y - (y1 + u*dy)); } }
+    if (dist < bd){ bd = dist; best = d; }
+  }
+  return best;
+}
+function setTool(t){
+  tool = t; pending = null; rubber = null;
+  document.querySelectorAll("#tools button").forEach(b => b.setAttribute("aria-pressed", b.dataset.tool === t));
+  $("draw").classList.toggle("active", t !== "off");
+  $("hint").textContent = {off:"", line:"Tap the start point, then the end point (or drag).", hline:"Tap the price level.", up:"Tap where the arrow tip should point.", down:"Tap where the arrow tip should point.", text:"Tap where the text should go."}[t];
+  redrawD();
+}
+function selectD(d){ selected = d; $("dDel").disabled = !d; redrawD(); }
+document.querySelectorAll("#tools button").forEach(b => b.addEventListener("click", () => setTool(b.dataset.tool)));
+let downAt = null;
+$("draw").addEventListener("pointerdown", e => {
+  const r = $("draw").getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top, pt = ptFromXY(x, y); if (!pt) return;
+  e.preventDefault(); downAt = {x, y};
+  if (tool === "hline"){ const d = {id:Date.now(), type:"hline", a:pt}; drawings.push(d); saveD(); setTool("off"); selectD(d); }
+  else if (tool === "up" || tool === "down"){ const d = {id:Date.now(), type:tool, a:pt}; drawings.push(d); saveD(); setTool("off"); selectD(d); }
+  else if (tool === "text"){ const txt = prompt("Text to place on the chart:"); if (txt && txt.trim()){ const d = {id:Date.now(), type:"text", a:pt, text:txt.trim()}; drawings.push(d); saveD(); selectD(d); } setTool("off"); }
+  else if (tool === "line"){
+    if (!pending){ pending = pt; rubber = {type:"line", a:pt, b:pt}; $("hint").textContent = "Now tap the end point."; $("draw").setPointerCapture(e.pointerId); }
+    else { const d = {id:Date.now(), type:"line", a:pending, b:pt}; drawings.push(d); saveD(); setTool("off"); selectD(d); }
+  }
+  redrawD();
+});
+$("draw").addEventListener("pointermove", e => {
+  if (tool !== "line" || !pending) return;
+  const r = $("draw").getBoundingClientRect(), pt = ptFromXY(e.clientX - r.left, e.clientY - r.top); if (pt){ rubber = {type:"line", a:pending, b:pt}; redrawD(); }
+});
+$("draw").addEventListener("pointerup", e => {
+  if (tool !== "line" || !pending || !downAt) return;
+  const r = $("draw").getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  if (Math.hypot(x - downAt.x, y - downAt.y) > 10){ const pt = ptFromXY(x, y); if (pt){ const d = {id:Date.now(), type:"line", a:pending, b:pt}; drawings.push(d); saveD(); setTool("off"); selectD(d); } }
+});
+$("dDel").addEventListener("click", () => { if (!selected) return; drawings = drawings.filter(d => d !== selected); saveD(); selectD(null); });
+$("dUndo").addEventListener("click", () => { drawings.pop(); saveD(); selectD(null); });
+$("dClear").addEventListener("click", () => { if (drawings.length && confirm("Remove all lines and text from the chart?")){ drawings = []; saveD(); selectD(null); } });
 
 try { const s = localStorage.getItem("tf"); if (s){ tf = s; document.querySelectorAll("#tf button").forEach(x => x.setAttribute("aria-pressed", x.dataset.tf === tf)); } } catch(e){}
 buildChart();
