@@ -39,6 +39,7 @@ main{flex:1;position:relative;min-height:320px}
 #chart{position:absolute;inset:0}
 #draw{position:absolute;left:0;top:0;z-index:5;pointer-events:none;touch-action:none;overflow:hidden}
 #draw.active{pointer-events:auto;cursor:crosshair}
+#draw.editing{pointer-events:auto;cursor:move}
 #draw text{font:500 13px var(--font);paint-order:stroke;stroke:var(--paper);stroke-width:4px;stroke-linejoin:round}
 .drawbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:8px 16px;border-bottom:1px solid var(--rule)}
 .drawbar .lbl{font-size:13px;color:var(--ink2)}
@@ -253,7 +254,6 @@ function buildChart(){
   series = chart.addCandlestickSeries({upColor:css("--up"), downColor:ink, borderUpColor:ink, borderDownColor:ink, wickUpColor:ink, wickDownColor:ink, priceLineVisible:true, lastValueVisible:true});
   chart.timeScale().subscribeVisibleLogicalRangeChange(() => redrawD());
   chart.timeScale().subscribeSizeChange(() => redrawD());
-  chart.subscribeClick(p => { if (tool === "off" && p.point) selectD(hitD(p.point.x, p.point.y)); });
   chart.subscribeCrosshairMove(p => { redrawD();
     const d = p.time !== undefined && p.seriesData.get(series);
     showReadout(d || null);
@@ -404,15 +404,38 @@ function hitD(x, y){
 function setTool(t){
   tool = t; pending = null; rubber = null;
   document.querySelectorAll("#tools button").forEach(b => b.setAttribute("aria-pressed", b.dataset.tool === t));
-  $("draw").classList.toggle("active", t !== "off");
+  $("draw").classList.toggle("active", t !== "off"); if (t !== "off"){ selected = null; $("dDel").disabled = true; $("draw").classList.remove("editing"); }
   $("hint").textContent = {off:"", line:"Tap the start point, then the end point (or drag).", hline:"Tap the price level.", up:"Tap where the arrow tip should point.", down:"Tap where the arrow tip should point.", text:"Tap where the text should go."}[t];
   redrawD();
 }
-function selectD(d){ selected = d; $("dDel").disabled = !d; redrawD(); }
+function selectD(d){
+  selected = d; $("dDel").disabled = !d;
+  $("draw").classList.toggle("editing", !!d && tool === "off");
+  if (tool === "off") $("hint").textContent = d ? (d.type === "line" ? "Drag the line to move it, or drag an end point to stretch it. Tap empty space when done." : "Drag to move it. Tap empty space when done.") : "";
+  redrawD();
+}
 document.querySelectorAll("#tools button").forEach(b => b.addEventListener("click", () => setTool(b.dataset.tool)));
 let downAt = null;
+let drag = null;
 $("draw").addEventListener("pointerdown", e => {
-  const r = $("draw").getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top, pt = ptFromXY(x, y); if (!pt) return;
+  const r = $("draw").getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  if (tool === "off"){                                   // editing a selected drawing
+    e.preventDefault();
+    let mode = null, d = null;
+    if (selected && selected.type === "line"){
+      const ax = X(selected.a.t), ay = Y(selected.a.p), bx = X(selected.b.t), by = Y(selected.b.p);
+      if (ax !== null && Math.hypot(x - ax, y - ay) < 16){ d = selected; mode = "a"; }
+      else if (bx !== null && Math.hypot(x - bx, y - by) < 16){ d = selected; mode = "b"; }
+    }
+    if (!d){ d = hitD(x, y); mode = d ? "move" : null; }
+    if (!d){ drag = {deselect: true}; $("draw").setPointerCapture(e.pointerId); return; }
+    if (d !== selected) selectD(d);
+    const l0 = chart.timeScale().coordinateToLogical(x), p0 = series.coordinateToPrice(y); if (l0 === null || p0 === null) return;
+    drag = {d, mode, l0, p0, orig: JSON.parse(JSON.stringify({a: d.a, b: d.b}))};
+    $("draw").setPointerCapture(e.pointerId);
+    return;
+  }
+  const pt = ptFromXY(x, y); if (!pt) return;
   e.preventDefault(); downAt = {x, y};
   if (tool === "hline"){ const d = {id:Date.now(), type:"hline", a:pt}; drawings.push(d); saveD(); setTool("off"); selectD(d); }
   else if (tool === "up" || tool === "down"){ const d = {id:Date.now(), type:tool, a:pt}; drawings.push(d); saveD(); setTool("off"); selectD(d); }
@@ -424,10 +447,35 @@ $("draw").addEventListener("pointerdown", e => {
   redrawD();
 });
 $("draw").addEventListener("pointermove", e => {
+  if (drag && drag.deselect) return;
+  if (drag){
+    const r = $("draw").getBoundingClientRect(), l = chart.timeScale().coordinateToLogical(e.clientX - r.left), p = series.coordinateToPrice(e.clientY - r.top);
+    if (l === null || p === null) return;
+    const dl = l - drag.l0, dp = p - drag.p0, d = drag.d, o = drag.orig;
+    const shift = a => ({t: timeFromLogical(logicalFromTime(a.t) + dl), p: a.p + dp});
+    if (drag.mode === "move"){ d.a = shift(o.a); if (o.b) d.b = shift(o.b); }
+    else d[drag.mode] = {t: timeFromLogical(l), p};
+    redrawD(); return;
+  }
   if (tool !== "line" || !pending) return;
   const r = $("draw").getBoundingClientRect(), pt = ptFromXY(e.clientX - r.left, e.clientY - r.top); if (pt){ rubber = {type:"line", a:pending, b:pt}; redrawD(); }
 });
+let tapAt = null;
+$("chart").addEventListener("pointerdown", e => { tapAt = {x: e.clientX, y: e.clientY, t: Date.now()}; }, true);
+$("chart").addEventListener("pointerup", e => {
+  if (!tapAt || tool !== "off") return;
+  const moved = Math.hypot(e.clientX - tapAt.x, e.clientY - tapAt.y), quick = Date.now() - tapAt.t < 600; tapAt = null;
+  if (moved > 8 || !quick) return;
+  const r = $("draw").getBoundingClientRect(), d = hitD(e.clientX - r.left, e.clientY - r.top);
+  if (d) selectD(d);
+}, true);
+document.addEventListener("pointerdown", e => {      // tapping outside the chart (axes, header) also finishes editing
+  if (selected && tool === "off" && !e.target.closest("#draw") && !e.target.closest(".drawbar") && !e.target.closest("#chart")) selectD(null);
+}, true);
+const endDrag = () => { if (!drag) return; const ds = drag.deselect; drag = null; if (ds) selectD(null); else saveD(); };
+$("draw").addEventListener("pointercancel", endDrag);
 $("draw").addEventListener("pointerup", e => {
+  if (drag){ endDrag(); return; }
   if (tool !== "line" || !pending || !downAt) return;
   const r = $("draw").getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
   if (Math.hypot(x - downAt.x, y - downAt.y) > 10){ const pt = ptFromXY(x, y); if (pt){ const d = {id:Date.now(), type:"line", a:pending, b:pt}; drawings.push(d); saveD(); setTool("off"); selectD(d); } }
