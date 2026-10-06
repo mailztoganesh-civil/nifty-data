@@ -17,10 +17,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Download latest data
-        run: python collector.py
-      - name: Build continuous futures file
-        run: python build_continuous.py
+            - name: Download latest data
+        run: python collector_yahoo.py
       - name: Commit data
         run: |
           git config user.name  "github-actions"
