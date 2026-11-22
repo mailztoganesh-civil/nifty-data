@@ -1,0 +1,10 @@
+[package]
+name = "futures-collector"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nse-rs = { git = "https://github.com/ratan00/nse-rs.git" }
+tokio  = { version = "1", features = ["full"] }
+chrono = "0.4"
+anyhow = "1"
