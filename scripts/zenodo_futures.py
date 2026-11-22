@@ -35,7 +35,7 @@ def download() -> zipfile.ZipFile:
 
 
 def is_futures(name: str) -> bool:
-    n = name.lower()
+    n = name.lower().rsplit("/", 1)[-1]
     return ("fut" in n) or bool(re.search(r"(^|[^a-z])f1([^0-9]|$)", n))
 
 
@@ -119,8 +119,25 @@ def normalise(raw: pd.DataFrame) -> pd.DataFrame | None:
     return out.dropna(subset=["datetime", "open", "close"])
 
 
+def flatten(zf: zipfile.ZipFile) -> zipfile.ZipFile:
+    """Unpack zips nested inside the zip (e.g. 2017.zip) into one in-memory zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as out:
+        def add(z, prefix=""):
+            for n in z.namelist():
+                if n.endswith("/"):
+                    continue
+                data = z.read(n)
+                if n.lower().endswith(".zip"):
+                    add(zipfile.ZipFile(io.BytesIO(data)), prefix + n[:-4] + "/")
+                else:
+                    out.writestr(prefix + n, data)
+        add(zf)
+    return zipfile.ZipFile(buf)
+
+
 def main():
-    zf = download()
+    zf = flatten(download())
     names = [n for n in zf.namelist() if not n.endswith("/")]
     (OUT / "zip_manifest.txt").write_text("\n".join(names))
     print(f"{len(names)} files in zip")

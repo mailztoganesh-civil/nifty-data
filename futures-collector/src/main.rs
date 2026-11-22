@@ -92,8 +92,9 @@ async fn collect_intraday(client: &NseClient) -> Result<()> {
                 let mut bars = read_bars(&path);
                 let before = bars.len();
                 for c in candles {
+                    // nse-rs candle times are already IST wall-clock in epoch ms
                     let Some(t) = DateTime::from_timestamp_millis(c.time) else { continue };
-                    let t = t.with_timezone(&ist()).naive_local();
+                    let t = t.naive_utc();
                     bars.insert(t, format!("{},{},{},{},{}", c.open, c.high, c.low, c.close, c.volume));
                 }
                 write_bars(&path, &bars, None)?;
@@ -159,11 +160,30 @@ async fn collect_daily(client: &NseClient) -> Result<()> {
     Ok(())
 }
 
+async fn debug(client: &NseClient) {
+    let end = Utc::now();
+    let syms = ["NIFTY 50", "SBIN", "NIFTY26DECFUT", "NIFTY26NOVFUT", "NIFTY"];
+    let tries: [(&str, i64); 6] = [("1", 3), ("1", 7), ("1", 15), ("1", 29), ("5", 7), ("D", 30)];
+    for sym in syms {
+        for (iv, days) in tries {
+            match client.get_historical_candles(sym, end - Duration::days(days), end, iv).await {
+                Ok(c) => println!("DEBUG {sym:>14} iv={iv} days={days}: {} candles {}", c.len(),
+                    c.first().map(|x| format!("first={} close={}", x.time, x.close)).unwrap_or_default()),
+                Err(e) => println!("DEBUG {sym:>14} iv={iv} days={days}: ERR {e:#}"),
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     fs::create_dir_all(OUT)?;
     let client = NseClient::new();
     client.init_session().await.context("NSE session (NSE may be blocking this IP)")?;
+    if std::env::args().any(|a| a == "--debug") {
+        debug(&client).await;
+        return Ok(());
+    }
 
     let mut ok = false;
     match collect_intraday(&client).await {
