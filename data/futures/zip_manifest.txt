@@ -1,0 +1,8 @@
+Nifty spot and futures data/2017/2017/NIFTY.csv
+Nifty spot and futures data/2017/2017/NIFTY_F1.csv
+Nifty spot and futures data/2018/2018/NIFTY.csv
+Nifty spot and futures data/2018/2018/NIFTY_F1.csv
+Nifty spot and futures data/2019/2019/NIFTY.csv
+Nifty spot and futures data/2019/2019/NIFTY_F1.csv
+Nifty spot and futures data/2020/2020/NIFTY.csv
+Nifty spot and futures data/2020/2020/NIFTY_F1.csv
